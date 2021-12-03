@@ -26,11 +26,12 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/pingcap/tidb-tools/sync_diff_inspector/chunk"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/mysql"
 	"go.uber.org/zap"
+
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/chunk"
 )
 
 // WorkerPool contains a pool of workers.
@@ -796,7 +797,7 @@ func GetSelectivity(ctx context.Context, db *sql.DB, schemaName, tableName, colu
 // CalculateChunkSize returns chunkSize according to table rows count.
 func CalculateChunkSize(rowCount int64) int64 {
 	// we assume chunkSize is 50000 for any cluster.
-	chunkSize := int64(50000)
+	chunkSize := int64(100)
 	if rowCount > int64(chunkSize)*10000 {
 		// we assume we only need 10k chunks for any table.
 		chunkSize = rowCount / 10000

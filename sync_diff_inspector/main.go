@@ -23,10 +23,11 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/tidb-tools/pkg/utils"
-	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
 	flag "github.com/spf13/pflag"
 	"go.uber.org/zap"
+
+	"github.com/pingcap/tidb-tools/pkg/utils"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
 )
 
 func main() {
@@ -96,6 +97,16 @@ func checkSyncState(ctx context.Context, cfg *config.Config) bool {
 		return false
 	}
 	defer d.Close()
+
+	if cfg.Incremental {
+		err := d.IncrementalValidate(ctx)
+		if err != nil {
+			fmt.Printf("There is something error when compare data of table, please check log info in %s\n", filepath.Join(cfg.Task.OutputDir, config.LogFileName))
+			log.Fatal("failed to check data difference", zap.Error(err))
+			return false
+		}
+		return true
+	}
 
 	err = d.StructEqual(ctx)
 	if err != nil {

@@ -26,9 +26,17 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	dmutils "github.com/pingcap/dm/pkg/utils"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
+	tidbconfig "github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/siddontang/go/ioutil2"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/checkpoints"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/chunk"
@@ -39,10 +47,6 @@ import (
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/splitter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/utils"
-	tidbconfig "github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/parser/model"
-	"github.com/siddontang/go/ioutil2"
-	"go.uber.org/zap"
 )
 
 const (
@@ -82,6 +86,8 @@ type Diff struct {
 	cp         *checkpoints.Checkpoint
 	startRange *splitter.RangeInfo
 	report     *report.Report
+
+	failedChanges map[string]*tableChange
 }
 
 // NewDiff returns a Diff instance.
@@ -93,6 +99,7 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		sqlCh:            make(chan *ChunkDML, splitter.DefaultChannelBuffer),
 		cp:               new(checkpoints.Checkpoint),
 		report:           report.NewReport(&cfg.Task),
+		failedChanges:    make(map[string]*tableChange),
 	}
 	if err = diff.init(ctx, cfg); err != nil {
 		diff.Close()
@@ -289,6 +296,142 @@ func (df *Diff) Equal(ctx context.Context) error {
 		})
 	}
 
+	return nil
+}
+
+type rowChangeType int
+
+const (
+	rowInsert rowChangeType = iota
+	rowDeleted
+	rowUpdated
+)
+
+type tableChange struct {
+	name  string
+	rows  []rowChange
+	minTs int64
+}
+
+type rowChange struct {
+	pkValues   []string
+	theType    rowChangeType
+	lastMeetTs int64 // the last meet timestamp
+}
+
+// IncrementalValidate right now we assume there is only one upstream
+func (df *Diff) IncrementalValidate(ctx context.Context) error {
+	randomServerID, err := dmutils.GetRandomServerID(ctx, df.upstream.GetDB())
+	if err != nil {
+		return err
+	}
+	sources := df.upstream.(*source.MySQLSources)
+
+	syncerCfg := replication.BinlogSyncerConfig{
+		ServerID:       randomServerID,
+		Flavor:         "mysql",
+		Host:           sources.Ds[0].Host,
+		Port:           uint16(sources.Ds[0].Port),
+		User:           sources.Ds[0].User,
+		Password:       sources.Ds[0].Password,
+		UseDecimal:     false,
+		VerifyChecksum: true,
+	}
+
+	//if !EnableGTID {
+	//	syncerCfg.RawModeEnabled = true
+	//}
+	binlogSyncer := replication.NewBinlogSyncer(syncerCfg)
+	gtidSet, _ := mysql.ParseMysqlGTIDSet("")
+	binlogStreamer, err := binlogSyncer.StartSyncGTID(gtidSet)
+	if err != nil {
+		return err
+	}
+	for {
+		e, err := binlogStreamer.GetEvent(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\rcurrent log pos %d", e.Header.LogPos)
+		switch ev := e.Event.(type) {
+		case *replication.QueryEvent:
+			// TODO not processed now
+		case *replication.RowsEvent:
+			schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
+			tableIdx := 0
+			table := sources.GetTable(schemaName, tableName)
+			for i, t := range sources.GetTables() {
+				if t.Schema == schemaName && t.Table == tableName {
+                    table = t
+					tableIdx = i
+                    break
+                }
+			}
+			if table == nil {
+				continue
+			}
+			var primaryIdx *model.IndexInfo
+			for _, idx := range table.Info.Indices {
+				if idx.Primary {
+					primaryIdx = idx
+				}
+			}
+			if primaryIdx == nil {
+				panic("no primary index")
+			}
+			pkColumn := table.Info.GetPkColInfo() // should be checked before, can not be nil
+			// TODO incomplete row event
+			for _, cols := range ev.SkippedColumns {
+				if len(cols) > 0 {
+					return errors.New("")
+				}
+			}
+			switch e.Header.EventType {
+			case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
+				pkVals := make([]interface{}, 0)
+				for _, row := range ev.Rows {
+					pkVals = append(pkVals, row[int(pkColumn.ID)])
+				}
+				chunkRange := chunk.NewChunkRange()
+				chunkRange.ColumnName = pkColumn.Name.O
+				chunkRange.Args = pkVals
+				chunkRange.Index.TableIndex = tableIdx
+				chunkRange.InitWhere()
+				rangeInfo := &splitter.RangeInfo{
+					ChunkRange: chunkRange,
+					IndexID:    primaryIdx.ID,
+					ProgressID: dbutil.TableName(schemaName, tableName),
+				}
+				dml := &ChunkDML{
+					node: rangeInfo.ToNode(),
+				}
+				equal, err := df.compareRows(ctx, rangeInfo, dml)
+				if err != nil {
+					panic(err)
+				}
+				if !equal {
+					log.Warn("failed to validate row", zap.Reflect("pk-val", pkVals))
+				}
+			case replication.UPDATE_ROWS_EVENTv0, replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
+			case replication.DELETE_ROWS_EVENTv0, replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
+			default:
+				log.Info("ignoring unrecognized event", zap.Reflect("event", e.Header))
+				return nil
+			}
+		}
+	}
+	// pull events from binlog
+	// for events behind "now - delay" do
+	//   if event is a interested event
+	//     get pk of the row
+	// for all new rows+previous failed rows do
+	//   call df.compareRows(ctx, info, dml)
+	//   if not equal
+	//     record failed rows
+	// if number of failed rows > max_failed_rows
+	//   pause validation
+	// else
+	//   continue validation
 	return nil
 }
 

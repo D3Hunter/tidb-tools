@@ -22,14 +22,15 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/parser/model"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/splitter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/utils"
-	"github.com/pingcap/tidb/parser/model"
-	"go.uber.org/zap"
 )
 
 type MySQLTableAnalyzer struct {
@@ -57,6 +58,8 @@ func (a *MySQLTableAnalyzer) AnalyzeSplitter(ctx context.Context, table *common.
 }
 
 type MySQLSources struct {
+	// TODO to ease impl of prototype, just add it here
+	Ds         []*config.DataSource
 	tableDiffs []*common.TableDiff
 
 	sourceTablesMap map[string][]*common.TableShardSource
@@ -138,6 +141,15 @@ func (s *MySQLSources) GetCountAndCrc32(ctx context.Context, tableRange *splitte
 
 func (s *MySQLSources) GetTables() []*common.TableDiff {
 	return s.tableDiffs
+}
+
+func (s *MySQLSources) GetTable(schema, table string) *common.TableDiff {
+	for _, td := range s.tableDiffs {
+		if td.Schema == schema && td.Table == table {
+            return td
+        }
+	}
+	return nil
 }
 
 func (s *MySQLSources) GenerateFixSQL(t DMLType, upstreamData, downstreamData map[string]*dbutil.ColumnData, tableIndex int) string {
@@ -353,6 +365,7 @@ func NewMySQLSources(ctx context.Context, tableDiffs []*common.TableDiff, ds []*
 	}
 
 	mss := &MySQLSources{
+		Ds:              ds,
 		tableDiffs:      tableDiffs,
 		sourceTablesMap: sourceTablesMap,
 	}
