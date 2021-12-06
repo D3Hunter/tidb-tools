@@ -41,6 +41,7 @@ import (
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/checkpoints"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/chunk"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/continuous"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/progress"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/report"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source"
@@ -87,7 +88,9 @@ type Diff struct {
 	startRange *splitter.RangeInfo
 	report     *report.Report
 
+	cfg           *config.Config
 	failedChanges map[string]*tableChange
+	changeCount   []int
 }
 
 // NewDiff returns a Diff instance.
@@ -99,7 +102,9 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		sqlCh:            make(chan *ChunkDML, splitter.DefaultChannelBuffer),
 		cp:               new(checkpoints.Checkpoint),
 		report:           report.NewReport(&cfg.Task),
+		cfg:              cfg,
 		failedChanges:    make(map[string]*tableChange),
+		changeCount:      make([]int, rowUpdated+1),
 	}
 	if err = diff.init(ctx, cfg); err != nil {
 		diff.Close()
@@ -204,7 +209,9 @@ func (df *Diff) initCheckpoint() error {
 			return errors.Trace(err)
 		}
 	}
-	progress.Init(len(df.workSource.GetTables()), finishTableNums)
+	if !df.cfg.Incremental {
+		progress.Init(len(df.workSource.GetTables()), finishTableNums)
+	}
 	return nil
 }
 
@@ -302,21 +309,31 @@ func (df *Diff) Equal(ctx context.Context) error {
 type rowChangeType int
 
 const (
-	rowInsert rowChangeType = iota
+	rowInvalidChange rowChangeType = iota
+	rowInsert
 	rowDeleted
 	rowUpdated
 )
 
 type tableChange struct {
 	name  string
-	rows  []rowChange
+	rows  map[string]*rowChange
 	minTs int64
 }
 
 type rowChange struct {
 	pkValues   []string
 	theType    rowChangeType
-	lastMeetTs int64 // the last meet timestamp
+	lastMeetTs int64 // the last meet timestamp(in seconds)
+}
+
+func (df *Diff) getFailedRowCnt() int {
+	// TODO concurrent access
+	var res int
+	for _, v := range df.failedChanges {
+		res += len(v.rows)
+	}
+	return res
 }
 
 // IncrementalValidate right now we assume there is only one upstream
@@ -347,26 +364,28 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	log.Info("start incremental validation")
 	for {
 		e, err := binlogStreamer.GetEvent(ctx)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("\rcurrent log pos %d", e.Header.LogPos)
+		fmt.Printf("\revents: %3d/%3d/%3d, failed: %3d, current log pos %d",
+			df.changeCount[rowInsert], df.changeCount[rowUpdated], df.changeCount[rowDeleted], df.getFailedRowCnt(),
+			e.Header.LogPos)
+		eventTime := time.Unix(int64(e.Header.Timestamp), 0)
+		lag := time.Now().Sub(eventTime)
+		if lag < 5*time.Second {
+			time.Sleep(5*time.Second - lag)
+		}
+
 		switch ev := e.Event.(type) {
 		case *replication.QueryEvent:
 			// TODO not processed now
 		case *replication.RowsEvent:
+			time.Unix(int64(e.Header.Timestamp), 0)
 			schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
-			tableIdx := 0
 			table := sources.GetTable(schemaName, tableName)
-			for i, t := range sources.GetTables() {
-				if t.Schema == schemaName && t.Table == tableName {
-                    table = t
-					tableIdx = i
-                    break
-                }
-			}
 			if table == nil {
 				continue
 			}
@@ -379,45 +398,20 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 			if primaryIdx == nil {
 				panic("no primary index")
 			}
-			pkColumn := table.Info.GetPkColInfo() // should be checked before, can not be nil
 			// TODO incomplete row event
 			for _, cols := range ev.SkippedColumns {
 				if len(cols) > 0 {
 					return errors.New("")
 				}
 			}
-			switch e.Header.EventType {
-			case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
-				pkVals := make([]interface{}, 0)
-				for _, row := range ev.Rows {
-					pkVals = append(pkVals, row[int(pkColumn.ID)])
-				}
-				chunkRange := chunk.NewChunkRange()
-				chunkRange.ColumnName = pkColumn.Name.O
-				chunkRange.Args = pkVals
-				chunkRange.Index.TableIndex = tableIdx
-				chunkRange.InitWhere()
-				rangeInfo := &splitter.RangeInfo{
-					ChunkRange: chunkRange,
-					IndexID:    primaryIdx.ID,
-					ProgressID: dbutil.TableName(schemaName, tableName),
-				}
-				dml := &ChunkDML{
-					node: rangeInfo.ToNode(),
-				}
-				equal, err := df.compareRows(ctx, rangeInfo, dml)
-				if err != nil {
-					panic(err)
-				}
-				if !equal {
-					log.Warn("failed to validate row", zap.Reflect("pk-val", pkVals))
-				}
-			case replication.UPDATE_ROWS_EVENTv0, replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
-			case replication.DELETE_ROWS_EVENTv0, replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
-			default:
+			changeType := getRowChangeType(e.Header.EventType)
+			if changeType == rowInvalidChange {
 				log.Info("ignoring unrecognized event", zap.Reflect("event", e.Header))
 				return nil
 			}
+
+			df.changeCount[changeType]++
+			df.validateChanges(ctx, table, primaryIdx, ev.Rows, int64(e.Header.Timestamp), changeType)
 		}
 	}
 	// pull events from binlog
@@ -433,6 +427,81 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 	// else
 	//   continue validation
 	return nil
+}
+
+func getRowChangeType(t replication.EventType) rowChangeType {
+	switch t {
+	case replication.WRITE_ROWS_EVENTv0, replication.WRITE_ROWS_EVENTv1, replication.WRITE_ROWS_EVENTv2:
+		return rowInsert
+	case replication.UPDATE_ROWS_EVENTv0, replication.UPDATE_ROWS_EVENTv1, replication.UPDATE_ROWS_EVENTv2:
+		return rowUpdated
+	case replication.DELETE_ROWS_EVENTv0, replication.DELETE_ROWS_EVENTv1, replication.DELETE_ROWS_EVENTv2:
+		return rowDeleted
+	default:
+		return rowInvalidChange
+	}
+}
+
+func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pk *model.IndexInfo, rows [][]interface{},
+	timestamp int64, changeType rowChangeType) {
+	pkValues := make([][]string, 0)
+	step := 1
+	if changeType == rowUpdated {
+		step = 2
+	}
+	pkIndices := make([]int, len(pk.Columns))
+	for i, col := range pk.Columns {
+		pkIndices[i] = table.ColumnMap[col.Name.O].Offset
+	}
+	for i := 0; i < len(rows); i += step {
+		row := rows[i]
+		key := make([]string, len(pk.Columns))
+		for _, idx := range pkIndices {
+			key[i] = fmt.Sprintf("%v", row[idx])
+		}
+		pkValues = append(pkValues, key)
+	}
+	cond := &continuous.Cond{Table: table, PrimaryKey: pk, PkValues: pkValues}
+	var failedPkValues [][]string
+	var err error
+	if changeType == rowDeleted {
+		failedPkValues, err = df.validateDeletedRows(ctx, cond)
+	} else {
+		failedPkValues, err = df.validateInsertAndUpdateRows(ctx, cond)
+	}
+	if err != nil {
+		panic(err)
+	}
+	if len(failedPkValues) > 0 {
+		df.addFailedRows(table, failedPkValues, timestamp, changeType)
+		log.Warn("failed to validate row", zap.Reflect("pk-val", pkValues))
+	}
+}
+
+func (df *Diff) addFailedRows(table *common.TableDiff, failedPkValues [][]string, timestamp int64, typ rowChangeType) {
+	// TODO concurrent assess
+	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
+	change := df.failedChanges[fullTableName]
+	if change == nil {
+		change = &tableChange{
+			name: table.Table,
+			rows: make(map[string]*rowChange),
+		}
+		df.failedChanges[fullTableName] = change
+	}
+	for _, pkValue := range failedPkValues {
+		key := strings.Join(pkValue, "-")
+		if val, ok := change.rows[key]; ok {
+			val.theType = typ
+			val.lastMeetTs = timestamp
+		} else {
+			change.rows[key] = &rowChange{
+				pkValues:   pkValue,
+				theType:    typ,
+				lastMeetTs: timestamp,
+			}
+		}
+	}
 }
 
 func (df *Diff) StructEqual(ctx context.Context) error {
@@ -730,6 +799,114 @@ func (df *Diff) compareChecksumAndGetCount(ctx context.Context, tableRange *spli
 		return true, upstreamInfo.Count, nil
 	}
 	return false, upstreamInfo.Count, nil
+}
+
+func (df *Diff) validateDeletedRows(ctx context.Context, cond *continuous.Cond) ([][]string, error) {
+	downstreamRowsIterator, err := df.downstream.GetRows(ctx, cond)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer downstreamRowsIterator.Close()
+
+	var failedRows [][]string
+	for {
+		data, err := downstreamRowsIterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		if data == nil {
+			break
+		}
+		failedRows = append(failedRows, getPkValues(data, cond))
+	}
+	return failedRows, nil
+}
+
+func getPkValues(data map[string]*dbutil.ColumnData, cond *continuous.Cond) []string {
+	var pkValues []string
+	for _, pkColumn := range cond.PrimaryKey.Columns {
+		// TODO primary key cannot be null, if we uses unique key should make sure all columns are not null
+		pkValues = append(pkValues, string(data[pkColumn.Name.O].Data))
+	}
+	return pkValues
+}
+
+func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, cond *continuous.Cond) ([][]string, error) {
+	var failedRows [][]string
+	upstreamRowsIterator, err := df.upstream.GetRows(ctx, cond)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer upstreamRowsIterator.Close()
+	downstreamRowsIterator, err := df.downstream.GetRows(ctx, cond)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	defer downstreamRowsIterator.Close()
+
+	var lastUpstreamData, lastDownstreamData map[string]*dbutil.ColumnData
+
+	tableInfo := cond.Table.Info
+	_, orderKeyCols := dbutil.SelectUniqueOrderKey(tableInfo)
+	for {
+		if lastUpstreamData == nil {
+			lastUpstreamData, err = upstreamRowsIterator.Next()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if lastDownstreamData == nil {
+			lastDownstreamData, err = downstreamRowsIterator.Next()
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// more data on downstream, may come from other client, skip it
+		if lastUpstreamData == nil && lastDownstreamData != nil {
+			log.Debug("more data on downstream, may come from other client, skip it")
+			break
+		}
+
+		if lastDownstreamData == nil {
+			// target lack some data, should insert the last source datas
+			for lastUpstreamData != nil {
+				failedRows = append(failedRows, getPkValues(lastUpstreamData, cond))
+
+				lastUpstreamData, err = upstreamRowsIterator.Next()
+				if err != nil {
+					return nil, err
+				}
+			}
+			break
+		}
+
+		eq, cmp, err := utils.CompareData(lastUpstreamData, lastDownstreamData, orderKeyCols, tableInfo.Columns)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if eq {
+			lastDownstreamData = nil
+			lastUpstreamData = nil
+			continue
+		}
+
+		switch cmp {
+		case 1:
+			// more data on downstream, may come from other client, skip it
+			log.Debug("more data on downstream, may come from other client, skip it", zap.Reflect("data", lastDownstreamData))
+			lastDownstreamData = nil
+		case -1:
+			failedRows = append(failedRows, getPkValues(lastUpstreamData, cond))
+			lastUpstreamData = nil
+		case 0:
+			failedRows = append(failedRows, getPkValues(lastUpstreamData, cond))
+			lastUpstreamData = nil
+			lastDownstreamData = nil
+		}
+	}
+	return failedRows, nil
 }
 
 func (df *Diff) compareRows(ctx context.Context, rangeInfo *splitter.RangeInfo, dml *ChunkDML) (bool, error) {

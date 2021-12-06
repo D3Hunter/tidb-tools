@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/continuous"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/splitter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/utils"
@@ -164,6 +165,53 @@ func (s *MySQLSources) GenerateFixSQL(t DMLType, upstreamData, downstreamData ma
 		log.Fatal("Don't support this type", zap.Any("dml type", t))
 	}
 	return ""
+}
+
+func (s *MySQLSources) GetRows(ctx context.Context, cond *continuous.Cond) (RowDataIterator, error) {
+	sourceRows := make(map[int]*sql.Rows)
+
+	table := cond.Table
+	matchSources := getMatchedSourcesForTable(s.sourceTablesMap, table)
+
+	var rowsQuery string
+	var orderKeyCols []*model.ColumnInfo
+	for i, ms := range matchSources {
+		rowsQuery, orderKeyCols = utils.GetTableRowsQueryFormat(ms.OriginSchema, ms.OriginTable, table.Info, table.Collation)
+		query := fmt.Sprintf(rowsQuery, cond.GetWhere())
+		rows, err := ms.DBConn.QueryContext(ctx, query, cond.GetArgs()...)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		sourceRows[i] = rows
+	}
+
+	sourceRowDatas := &common.RowDatas{
+		Rows:         make([]common.RowData, 0, len(sourceRows)),
+		OrderKeyCols: orderKeyCols,
+	}
+	heap.Init(sourceRowDatas)
+	// first push one row from all the sources into heap
+	for source, sourceRow := range sourceRows {
+		rowData, err := getRowData(sourceRow)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if rowData != nil {
+			heap.Push(sourceRowDatas, common.RowData{
+				Data:   rowData,
+				Source: source,
+			})
+		} else {
+			if sourceRow.Err() != nil {
+				return nil, sourceRow.Err()
+			}
+		}
+	}
+
+	return &MultiSourceRowsIterator{
+		sourceRows:     sourceRows,
+		sourceRowDatas: sourceRowDatas,
+	}, nil
 }
 
 func (s *MySQLSources) GetRowsIterator(ctx context.Context, tableRange *splitter.RangeInfo) (RowDataIterator, error) {

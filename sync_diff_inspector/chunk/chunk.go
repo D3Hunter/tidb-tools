@@ -148,7 +148,6 @@ type Range struct {
 	IsFirst bool      `json:"is-first"`
 	IsLast  bool      `json:"is-last"`
 
-	ColumnName string `json:"column-name"`
 	Where string        `json:"where"`
 	Args  []interface{} `json:"args"`
 
@@ -423,19 +422,6 @@ func (c *Range) CopyAndUpdate(column, lower, upper string, updateLower, updateUp
 	newChunk := c.Copy()
 	newChunk.Update(column, lower, upper, updateLower, updateUpper)
 	return newChunk
-}
-
-func (c *Range) InitWhere() {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%s in (", dbutil.ColumnName(c.ColumnName)))
-	for i := range c.Args {
-		if i != 0 {
-            b.WriteString(",")
-        }
-		b.WriteString("?")
-	}
-	b.WriteString(")")
-	c.Where = b.String()
 }
 
 // Notice: chunk may contain not only one bucket, which can be expressed as a range [3, 5],

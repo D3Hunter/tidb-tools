@@ -21,14 +21,17 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/parser/model"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/continuous"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/splitter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/utils"
-	"github.com/pingcap/tidb/parser/model"
-	"go.uber.org/zap"
 )
 
 type TiDBTableAnalyzer struct {
@@ -161,6 +164,24 @@ func (s *TiDBSource) GenerateFixSQL(t DMLType, upstreamData, downstreamData map[
 	}
 	log.Fatal("Don't support this type", zap.Any("dml type", t))
 	return ""
+}
+
+func (s *TiDBSource) GetRows(ctx context.Context, cond *continuous.Cond) (RowDataIterator, error) {
+	table := cond.Table
+	matchedSource := getMatchSource(s.sourceTableMap, table)
+	rowsQuery, _ := utils.GetTableRowsQueryFormat(matchedSource.OriginSchema, matchedSource.OriginTable, table.Info, table.Collation)
+	query := fmt.Sprintf(rowsQuery, cond.GetWhere())
+
+	if cd := log.L().Check(zapcore.DebugLevel, ""); cd != nil {
+		log.Debug("select data", zap.String("sql", query), zap.Reflect("args", cond.GetArgs()))
+	}
+	rows, err := s.dbConn.QueryContext(ctx, query, cond.GetArgs()...)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &TiDBRowsIterator{
+		rows,
+	}, nil
 }
 
 func (s *TiDBSource) GetRowsIterator(ctx context.Context, tableRange *splitter.RangeInfo) (RowDataIterator, error) {

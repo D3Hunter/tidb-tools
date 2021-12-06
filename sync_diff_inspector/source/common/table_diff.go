@@ -47,6 +47,8 @@ type TableDiff struct {
 	// It used for TiDB/MySQL/MySQL Shard sources.
 	Info *model.TableInfo `json:"info"`
 
+	ColumnMap map[string]*model.ColumnInfo
+
 	// columns be ignored
 	IgnoreColumns []string `json:"-"`
 

@@ -22,16 +22,18 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
+	"github.com/pingcap/tidb/parser/model"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	tableFilter "github.com/pingcap/tidb-tools/pkg/table-filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/config"
+	"github.com/pingcap/tidb-tools/sync_diff_inspector/continuous"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/splitter"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/utils"
-	"github.com/pingcap/tidb/parser/model"
-	"go.uber.org/zap"
 )
 
 type DMLType int32
@@ -80,6 +82,7 @@ type Source interface {
 	// GetCountAndCrc32 gets the crc32 result and the count from given range.
 	GetCountAndCrc32(context.Context, *splitter.RangeInfo) *ChecksumInfo
 
+	GetRows(context.Context, *continuous.Cond) (RowDataIterator, error)
 	// GetRowsIterator gets the row data iterator from given range.
 	GetRowsIterator(context.Context, *splitter.RangeInfo) (RowDataIterator, error)
 
@@ -118,10 +121,15 @@ func NewSources(ctx context.Context, cfg *config.Config) (downstream Source, ups
 	tableDiffs := make([]*common.TableDiff, 0, len(tablesToBeCheck))
 	for _, tableConfig := range tablesToBeCheck {
 		newInfo, needUnifiedTimeZone := utils.ResetColumns(tableConfig.TargetTableInfo, tableConfig.IgnoreColumns)
+		columnMap := make(map[string]*model.ColumnInfo)
+		for _, col := range newInfo.Columns {
+			columnMap[col.Name.O] = col
+		}
 		tableDiffs = append(tableDiffs, &common.TableDiff{
 			Schema: tableConfig.Schema,
 			Table:  tableConfig.Table,
 			Info:   newInfo,
+			ColumnMap: columnMap,
 			// TODO: field `IgnoreColumns` can be deleted.
 			IgnoreColumns:       tableConfig.IgnoreColumns,
 			Fields:              strings.Join(tableConfig.Fields, ","),
