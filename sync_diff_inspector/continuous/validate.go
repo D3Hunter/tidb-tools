@@ -16,15 +16,12 @@ package continuous
 import (
 	"strings"
 
-	"github.com/pingcap/tidb/parser/model"
-
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 )
 
 type Cond struct {
-	Table      *common.TableDiff
-	PrimaryKey *model.IndexInfo
-	PkValues   [][]string
+	Table    *common.TableDiff
+	PkValues [][]string
 }
 
 func (c *Cond) GetArgs() []interface{} {
@@ -39,11 +36,12 @@ func (c *Cond) GetArgs() []interface{} {
 
 func (c *Cond) GetWhere() string {
 	var b strings.Builder
-	if len(c.PrimaryKey.Columns) > 1 {
+	pk := c.Table.PrimaryKey
+	if len(pk.Columns) > 1 {
 		// TODO
 		panic("should be one")
 	}
-	b.WriteString(c.PrimaryKey.Columns[0].Name.O)
+	b.WriteString(pk.Columns[0].Name.O)
 	b.WriteString(" in (")
 	for i := range c.PkValues {
 		if i != 0 {

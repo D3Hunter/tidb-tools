@@ -88,7 +88,9 @@ type Diff struct {
 	startRange *splitter.RangeInfo
 	report     *report.Report
 
-	cfg           *config.Config
+	continuousWg sync.WaitGroup
+	cfg          *config.Config
+	sync.RWMutex
 	failedChanges map[string]*tableChange
 	changeCount   []int
 }
@@ -316,19 +318,20 @@ const (
 )
 
 type tableChange struct {
-	name  string
+	table *common.TableDiff
 	rows  map[string]*rowChange
 	minTs int64
 }
 
 type rowChange struct {
-	pkValues   []string
+	pk         []string
 	theType    rowChangeType
 	lastMeetTs int64 // the last meet timestamp(in seconds)
 }
 
 func (df *Diff) getFailedRowCnt() int {
-	// TODO concurrent access
+	df.RLock()
+	defer df.RUnlock()
 	var res int
 	for _, v := range df.failedChanges {
 		res += len(v.rows)
@@ -365,6 +368,11 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		return err
 	}
 	log.Info("start incremental validation")
+
+	df.continuousWg.Add(1)
+	go df.retryFailedRows(ctx)
+
+	// TODO context done
 	for {
 		e, err := binlogStreamer.GetEvent(ctx)
 		if err != nil {
@@ -389,13 +397,7 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 			if table == nil {
 				continue
 			}
-			var primaryIdx *model.IndexInfo
-			for _, idx := range table.Info.Indices {
-				if idx.Primary {
-					primaryIdx = idx
-				}
-			}
-			if primaryIdx == nil {
+			if table.PrimaryKey == nil {
 				panic("no primary index")
 			}
 			// TODO incomplete row event
@@ -411,7 +413,7 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 			}
 
 			df.changeCount[changeType]++
-			df.validateChanges(ctx, table, primaryIdx, ev.Rows, int64(e.Header.Timestamp), changeType)
+			df.validateEventRows(ctx, table, ev.Rows, int64(e.Header.Timestamp), changeType)
 		}
 	}
 	// pull events from binlog
@@ -442,13 +444,14 @@ func getRowChangeType(t replication.EventType) rowChangeType {
 	}
 }
 
-func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pk *model.IndexInfo, rows [][]interface{},
+func (df *Diff) validateEventRows(ctx context.Context, table *common.TableDiff, rows [][]interface{},
 	timestamp int64, changeType rowChangeType) {
 	pkValues := make([][]string, 0)
 	step := 1
 	if changeType == rowUpdated {
 		step = 2
 	}
+	pk := table.PrimaryKey
 	pkIndices := make([]int, len(pk.Columns))
 	for i, col := range pk.Columns {
 		pkIndices[i] = table.ColumnMap[col.Name.O].Offset
@@ -461,45 +464,95 @@ func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pk
 		}
 		pkValues = append(pkValues, key)
 	}
-	cond := &continuous.Cond{Table: table, PrimaryKey: pk, PkValues: pkValues}
-	var failedPkValues [][]string
+	failedRows := df.validateChanges(ctx, table, pkValues, changeType)
+	df.updateFailedChanges(table, pkValues, failedRows, timestamp, changeType)
+}
+
+func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pkValues [][]string, changeType rowChangeType) [][]string {
+	cond := &continuous.Cond{Table: table, PkValues: pkValues}
+	var failedRows [][]string
 	var err error
 	if changeType == rowDeleted {
-		failedPkValues, err = df.validateDeletedRows(ctx, cond)
+		failedRows, err = df.validateDeletedRows(ctx, cond)
 	} else {
-		failedPkValues, err = df.validateInsertAndUpdateRows(ctx, cond)
+		failedRows, err = df.validateInsertAndUpdateRows(ctx, cond)
 	}
 	if err != nil {
 		panic(err)
 	}
-	if len(failedPkValues) > 0 {
-		df.addFailedRows(table, failedPkValues, timestamp, changeType)
-		log.Warn("failed to validate row", zap.Reflect("pk-val", pkValues))
-	}
+	return failedRows
 }
 
-func (df *Diff) addFailedRows(table *common.TableDiff, failedPkValues [][]string, timestamp int64, typ rowChangeType) {
+func (df *Diff) updateFailedChanges(table *common.TableDiff, allPkValues, failedPkValues [][]string, timestamp int64, typ rowChangeType) {
+	df.Lock()
+	defer df.Unlock()
 	// TODO concurrent assess
 	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
 	change := df.failedChanges[fullTableName]
 	if change == nil {
 		change = &tableChange{
-			name: table.Table,
-			rows: make(map[string]*rowChange),
+			table: table,
+			rows:  make(map[string]*rowChange),
 		}
 		df.failedChanges[fullTableName] = change
 	}
+	// remove previous failed rows related to current batch of rows
+	for _, pkValue := range allPkValues {
+		key := strings.Join(pkValue, "-")
+		delete(change.rows, key)
+	}
 	for _, pkValue := range failedPkValues {
 		key := strings.Join(pkValue, "-")
-		if val, ok := change.rows[key]; ok {
-			val.theType = typ
-			val.lastMeetTs = timestamp
-		} else {
-			change.rows[key] = &rowChange{
-				pkValues:   pkValue,
-				theType:    typ,
-				lastMeetTs: timestamp,
+		val, ok := change.rows[key]
+		if !ok {
+			val = &rowChange{pk: pkValue}
+			change.rows[key] = val
+		}
+		val.theType = typ
+		val.lastMeetTs = timestamp
+	}
+}
+
+func (df *Diff) retryFailedRows(ctx context.Context) {
+	df.continuousWg.Done()
+	for {
+		df.Lock()
+		for _, v := range df.failedChanges {
+			changes := make(map[rowChangeType][][]string)
+			for _, r := range v.rows {
+				changes[r.theType] = append(changes[r.theType], r.pk)
 			}
+			rows := make(map[string]*rowChange, 0)
+			if changes[rowInsert] != nil {
+				failedRows := df.validateChanges(ctx, v.table, changes[rowInsert], rowInsert)
+				for _, pk := range failedRows {
+					key := strings.Join(pk, "-")
+					rows[key] = v.rows[key]
+				}
+			}
+			if changes[rowUpdated] != nil {
+				failedRows := df.validateChanges(ctx, v.table, changes[rowUpdated], rowUpdated)
+				for _, pk := range failedRows {
+					key := strings.Join(pk, "-")
+					rows[key] = v.rows[key]
+				}
+			}
+			if changes[rowDeleted] != nil {
+				failedRows := df.validateChanges(ctx, v.table, changes[rowDeleted], rowDeleted)
+				for _, pk := range failedRows {
+					key := strings.Join(pk, "-")
+					rows[key] = v.rows[key]
+				}
+			}
+			v.rows = rows
+		}
+		df.Unlock()
+		fmt.Printf("after retry, failed: %3d", df.getFailedRowCnt())
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
 		}
 	}
 }
@@ -824,7 +877,7 @@ func (df *Diff) validateDeletedRows(ctx context.Context, cond *continuous.Cond) 
 
 func getPkValues(data map[string]*dbutil.ColumnData, cond *continuous.Cond) []string {
 	var pkValues []string
-	for _, pkColumn := range cond.PrimaryKey.Columns {
+	for _, pkColumn := range cond.Table.PrimaryKey.Columns {
 		// TODO primary key cannot be null, if we uses unique key should make sure all columns are not null
 		pkValues = append(pkValues, string(data[pkColumn.Name.O].Data))
 	}

@@ -125,11 +125,18 @@ func NewSources(ctx context.Context, cfg *config.Config) (downstream Source, ups
 		for _, col := range newInfo.Columns {
 			columnMap[col.Name.O] = col
 		}
+		var primaryIdx *model.IndexInfo
+		for _, idx := range newInfo.Indices {
+			if idx.Primary {
+				primaryIdx = idx
+			}
+		}
 		tableDiffs = append(tableDiffs, &common.TableDiff{
-			Schema: tableConfig.Schema,
-			Table:  tableConfig.Table,
-			Info:   newInfo,
-			ColumnMap: columnMap,
+			Schema:     tableConfig.Schema,
+			Table:      tableConfig.Table,
+			Info:       newInfo,
+			PrimaryKey: primaryIdx,
+			ColumnMap:  columnMap,
 			// TODO: field `IgnoreColumns` can be deleted.
 			IgnoreColumns:       tableConfig.IgnoreColumns,
 			Fields:              strings.Join(tableConfig.Fields, ","),
