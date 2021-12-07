@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,8 @@ import (
 const (
 	// checkpointFile represents the checkpoints' file name which used for save and loads chunks
 	checkpointFile = "sync_diff_checkpoints.pb"
+	defaultDelay   = 5 * time.Second
+	retryInterval  = 5 * time.Second
 )
 
 // ChunkDML SQL struct for each chunk
@@ -91,8 +94,8 @@ type Diff struct {
 	continuousWg sync.WaitGroup
 	cfg          *config.Config
 	sync.RWMutex
-	failedChanges map[string]*tableChange
-	changeCount   []int
+	failedChanges    map[string]*tableChange
+	changeEventCount []int
 }
 
 // NewDiff returns a Diff instance.
@@ -106,7 +109,7 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		report:           report.NewReport(&cfg.Task),
 		cfg:              cfg,
 		failedChanges:    make(map[string]*tableChange),
-		changeCount:      make([]int, rowUpdated+1),
+		changeEventCount: make([]int, rowUpdated+1),
 	}
 	if err = diff.init(ctx, cfg); err != nil {
 		diff.Close()
@@ -329,14 +332,20 @@ type rowChange struct {
 	lastMeetTs int64 // the last meet timestamp(in seconds)
 }
 
-func (df *Diff) getFailedRowCnt() int {
+func (df *Diff) getContinueValidationSummary() (int, int64) {
 	df.RLock()
 	defer df.RUnlock()
-	var res int
+	var count int
+	var minTs int64 = math.MaxInt64
 	for _, v := range df.failedChanges {
-		res += len(v.rows)
+		count += len(v.rows)
+		for _, r := range v.rows {
+			if r.lastMeetTs < minTs {
+				minTs = r.lastMeetTs
+			}
+		}
 	}
-	return res
+	return count, minTs
 }
 
 // IncrementalValidate right now we assume there is only one upstream
@@ -378,13 +387,13 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("\revents: %3d/%3d/%3d, failed: %3d, current log pos %d",
-			df.changeCount[rowInsert], df.changeCount[rowUpdated], df.changeCount[rowDeleted], df.getFailedRowCnt(),
-			e.Header.LogPos)
+		fmt.Printf("\revents: %3d/%3d/%3d, current log pos %d",
+			df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted], e.Header.LogPos)
 		eventTime := time.Unix(int64(e.Header.Timestamp), 0)
 		lag := time.Now().Sub(eventTime)
-		if lag < 5*time.Second {
-			time.Sleep(5*time.Second - lag)
+		// TODO delay should be configurable
+		if lag < defaultDelay {
+			time.Sleep(defaultDelay - lag)
 		}
 
 		switch ev := e.Event.(type) {
@@ -412,22 +421,10 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 				return nil
 			}
 
-			df.changeCount[changeType]++
+			df.changeEventCount[changeType]++
 			df.validateEventRows(ctx, table, ev.Rows, int64(e.Header.Timestamp), changeType)
 		}
 	}
-	// pull events from binlog
-	// for events behind "now - delay" do
-	//   if event is a interested event
-	//     get pk of the row
-	// for all new rows+previous failed rows do
-	//   call df.compareRows(ctx, info, dml)
-	//   if not equal
-	//     record failed rows
-	// if number of failed rows > max_failed_rows
-	//   pause validation
-	// else
-	//   continue validation
 	return nil
 }
 
@@ -464,6 +461,8 @@ func (df *Diff) validateEventRows(ctx context.Context, table *common.TableDiff, 
 		}
 		pkValues = append(pkValues, key)
 	}
+	// TODO limit number of rows queried
+	// TODO make rows in small events into a batch
 	failedRows := df.validateChanges(ctx, table, pkValues, changeType)
 	df.updateFailedChanges(table, pkValues, failedRows, timestamp, changeType)
 }
@@ -486,7 +485,7 @@ func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pk
 func (df *Diff) updateFailedChanges(table *common.TableDiff, allPkValues, failedPkValues [][]string, timestamp int64, typ rowChangeType) {
 	df.Lock()
 	defer df.Unlock()
-	// TODO concurrent assess
+	// TODO fine-grain lock
 	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
 	change := df.failedChanges[fullTableName]
 	if change == nil {
@@ -516,6 +515,10 @@ func (df *Diff) updateFailedChanges(table *common.TableDiff, allPkValues, failed
 func (df *Diff) retryFailedRows(ctx context.Context) {
 	df.continuousWg.Done()
 	for {
+		// TODO fine-grain lock
+		// TODO limit number of failed rows
+		// TODO limit number of retry, if number of retry > max_retry_count or after some time, move rows to error-rows
+		// TODO if error-rows > max_error_rows, pause validation
 		df.Lock()
 		for _, v := range df.failedChanges {
 			changes := make(map[rowChangeType][][]string)
@@ -547,12 +550,17 @@ func (df *Diff) retryFailedRows(ctx context.Context) {
 			v.rows = rows
 		}
 		df.Unlock()
-		fmt.Printf("after retry, failed: %3d", df.getFailedRowCnt())
+		cnt, ts := df.getContinueValidationSummary()
+		if cnt > 0 {
+			fmt.Printf("after retry, failed: %3d, min ts: %v\n", cnt, time.Unix(ts, 0))
+		} else {
+			fmt.Println("all events before delay time are validated successfully.")
+		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(5 * time.Second):
+		case <-time.After(retryInterval): // TODO wait time be configurable?
 		}
 	}
 }
