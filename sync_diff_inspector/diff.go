@@ -53,9 +53,11 @@ import (
 
 const (
 	// checkpointFile represents the checkpoints' file name which used for save and loads chunks
-	checkpointFile = "sync_diff_checkpoints.pb"
-	defaultDelay   = 5 * time.Second
-	retryInterval  = 5 * time.Second
+	checkpointFile     = "sync_diff_checkpoints.pb"
+	defaultDelay       = 5 * time.Second
+	retryInterval      = 5 * time.Second
+	batchRowCount      = 200
+	validationInterval = time.Second // when there's not enough data to validate, we check it every validationInterval
 )
 
 // ChunkDML SQL struct for each chunk
@@ -95,7 +97,10 @@ type Diff struct {
 	cfg          *config.Config
 	sync.RWMutex
 	failedChanges    map[string]*tableChange
+	pendingChanges   map[string]*tableChange
+	validateCh       chan map[string]*tableChange
 	changeEventCount []int
+	validationTimer  *time.Timer
 }
 
 // NewDiff returns a Diff instance.
@@ -109,7 +114,10 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		report:           report.NewReport(&cfg.Task),
 		cfg:              cfg,
 		failedChanges:    make(map[string]*tableChange),
+		pendingChanges:   make(map[string]*tableChange),
+		validateCh:       make(chan map[string]*tableChange),
 		changeEventCount: make([]int, rowUpdated+1),
+		validationTimer:  time.NewTimer(validationInterval),
 	}
 	if err = diff.init(ctx, cfg); err != nil {
 		diff.Close()
@@ -378,8 +386,9 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 	}
 	log.Info("start incremental validation")
 
-	df.continuousWg.Add(1)
+	df.continuousWg.Add(2)
 	go df.retryFailedRows(ctx)
+	go df.validateGoRoutine(ctx)
 
 	// TODO context done
 	for {
@@ -400,29 +409,9 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		case *replication.QueryEvent:
 			// TODO not processed now
 		case *replication.RowsEvent:
-			time.Unix(int64(e.Header.Timestamp), 0)
-			schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
-			table := sources.GetTable(schemaName, tableName)
-			if table == nil {
-				continue
+			if err := df.processEventRows(e.Header, ev); err != nil {
+				return err
 			}
-			if table.PrimaryKey == nil {
-				panic("no primary index")
-			}
-			// TODO incomplete row event
-			for _, cols := range ev.SkippedColumns {
-				if len(cols) > 0 {
-					return errors.New("")
-				}
-			}
-			changeType := getRowChangeType(e.Header.EventType)
-			if changeType == rowInvalidChange {
-				log.Info("ignoring unrecognized event", zap.Reflect("event", e.Header))
-				return nil
-			}
-
-			df.changeEventCount[changeType]++
-			df.validateEventRows(ctx, table, ev.Rows, int64(e.Header.Timestamp), changeType)
 		}
 	}
 	return nil
@@ -441,8 +430,48 @@ func getRowChangeType(t replication.EventType) rowChangeType {
 	}
 }
 
-func (df *Diff) validateEventRows(ctx context.Context, table *common.TableDiff, rows [][]interface{},
-	timestamp int64, changeType rowChangeType) {
+func (df *Diff) rowsEventProcessRoutine(ctx context.Context) {
+	df.continuousWg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (df *Diff) getPendingRowCount() int {
+	res := 0
+	for _, v:= range df.pendingChanges {
+		res += len(v.rows)
+	}
+	return res
+}
+
+func (df *Diff) processEventRows(header *replication.EventHeader, ev *replication.RowsEvent) error {
+	schemaName, tableName := string(ev.Table.Schema), string(ev.Table.Table)
+	sources := df.upstream.(*source.MySQLSources)
+	table := sources.GetTable(schemaName, tableName)
+	if table == nil {
+		return nil
+	}
+	if table.PrimaryKey == nil {
+		panic("no primary index")
+	}
+	// TODO incomplete row event
+	for _, cols := range ev.SkippedColumns {
+		if len(cols) > 0 {
+			return errors.New("")
+		}
+	}
+	changeType := getRowChangeType(header.EventType)
+	if changeType == rowInvalidChange {
+		log.Info("ignoring unrecognized event", zap.Reflect("event header", header))
+		return nil
+	}
+
+	df.changeEventCount[changeType]++
+
 	pkValues := make([][]string, 0)
 	step := 1
 	if changeType == rowUpdated {
@@ -453,25 +482,85 @@ func (df *Diff) validateEventRows(ctx context.Context, table *common.TableDiff, 
 	for i, col := range pk.Columns {
 		pkIndices[i] = table.ColumnMap[col.Name.O].Offset
 	}
-	for i := 0; i < len(rows); i += step {
-		row := rows[i]
+	for i := 0; i < len(ev.Rows); i += step {
+		row := ev.Rows[i]
 		key := make([]string, len(pk.Columns))
 		for _, idx := range pkIndices {
-			key[i] = fmt.Sprintf("%v", row[idx])
+			key[idx] = fmt.Sprintf("%v", row[idx])
 		}
 		pkValues = append(pkValues, key)
 	}
+
+	// TODO for every table merge events into batch
+	// TODO for every table validate the batch
+	rowCount := df.getPendingRowCount()
+	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
+	change := df.pendingChanges[fullTableName]
+	for _, pkValue := range pkValues {
+		if change == nil {
+			change = &tableChange{
+				table: table,
+				rows:  make(map[string]*rowChange),
+			}
+			df.pendingChanges[fullTableName] = change
+		}
+		key := strings.Join(pkValue, "-")
+		val, ok := change.rows[key]
+		if !ok {
+			val = &rowChange{pk: pkValue}
+			change.rows[key] = val
+			rowCount++
+		}
+		val.theType = changeType
+		val.lastMeetTs = int64(header.Timestamp)
+
+		if rowCount >= batchRowCount {
+			df.validateCh <- df.pendingChanges
+			df.pendingChanges = make(map[string]*tableChange)
+			if !df.validationTimer.Stop() {
+				<-df.validationTimer.C
+			}
+			df.validationTimer.Reset(validationInterval)
+
+			rowCount = 0
+			change = nil
+		}
+	}
+
+	select {
+	case <-df.validationTimer.C:
+		if len(df.pendingChanges) > 0 {
+			df.validateCh <- df.pendingChanges
+			df.pendingChanges = make(map[string]*tableChange)
+		}
+		df.validationTimer.Reset(validationInterval)
+	default:
+	}
 	// TODO limit number of rows queried
 	// TODO make rows in small events into a batch
-	failedRows := df.validateChanges(ctx, table, pkValues, changeType)
-	df.updateFailedChanges(table, pkValues, failedRows, timestamp, changeType)
+	return nil
 }
 
-func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pkValues [][]string, changeType rowChangeType) [][]string {
+func (df *Diff) validateGoRoutine(ctx context.Context) {
+	df.continuousWg.Done()
+	for {
+		select {
+		case change := <-df.validateCh:
+			df.Lock()
+			failed := df.validateTableChange(ctx, change)
+			df.updateFailedChanges(change, failed)
+			df.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pkValues [][]string, deleteChange bool) [][]string {
 	cond := &continuous.Cond{Table: table, PkValues: pkValues}
 	var failedRows [][]string
 	var err error
-	if changeType == rowDeleted {
+	if deleteChange {
 		failedRows, err = df.validateDeletedRows(ctx, cond)
 	} else {
 		failedRows, err = df.validateInsertAndUpdateRows(ctx, cond)
@@ -482,34 +571,69 @@ func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pk
 	return failedRows
 }
 
-func (df *Diff) updateFailedChanges(table *common.TableDiff, allPkValues, failedPkValues [][]string, timestamp int64, typ rowChangeType) {
-	df.Lock()
-	defer df.Unlock()
-	// TODO fine-grain lock
-	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
-	change := df.failedChanges[fullTableName]
-	if change == nil {
-		change = &tableChange{
-			table: table,
-			rows:  make(map[string]*rowChange),
-		}
-		df.failedChanges[fullTableName] = change
-	}
+func (df *Diff) updateFailedChanges(all, failed map[string]*tableChange) {
 	// remove previous failed rows related to current batch of rows
-	for _, pkValue := range allPkValues {
-		key := strings.Join(pkValue, "-")
-		delete(change.rows, key)
-	}
-	for _, pkValue := range failedPkValues {
-		key := strings.Join(pkValue, "-")
-		val, ok := change.rows[key]
-		if !ok {
-			val = &rowChange{pk: pkValue}
-			change.rows[key] = val
+	for k, v := range all {
+		prevFailed := df.failedChanges[k]
+		if prevFailed == nil {
+			continue
 		}
-		val.theType = typ
-		val.lastMeetTs = timestamp
+		for _, r := range v.rows {
+			key := strings.Join(r.pk, "-")
+			delete(prevFailed.rows, key)
+		}
 	}
+	for k, v := range failed {
+		prevFailed := df.failedChanges[k]
+		if prevFailed == nil {
+			prevFailed = &tableChange{
+				table: v.table,
+				rows:  make(map[string]*rowChange),
+			}
+			df.failedChanges[k] = prevFailed
+		}
+
+		for _, r := range v.rows {
+			key := strings.Join(r.pk, "-")
+			prevFailed.rows[key] = r
+		}
+	}
+}
+
+func (df *Diff) validateTableChange(ctx context.Context, tableChanges map[string]*tableChange) map[string]*tableChange {
+	failedChanges := make(map[string]*tableChange)
+	for k, v := range tableChanges {
+		var insertUpdateChanges, deleteChanges [][]string
+		for _, r := range v.rows {
+			if r.theType == rowDeleted {
+				deleteChanges = append(deleteChanges, r.pk)
+			} else {
+				insertUpdateChanges = append(insertUpdateChanges, r.pk)
+			}
+		}
+		rows := make(map[string]*rowChange, 0)
+		if len(insertUpdateChanges) > 0 {
+			failedRows := df.validateChanges(ctx, v.table, insertUpdateChanges, false)
+			for _, pk := range failedRows {
+				key := strings.Join(pk, "-")
+				rows[key] = v.rows[key]
+			}
+		}
+		if len(deleteChanges) > 0 {
+			failedRows := df.validateChanges(ctx, v.table, deleteChanges, true)
+			for _, pk := range failedRows {
+				key := strings.Join(pk, "-")
+				rows[key] = v.rows[key]
+			}
+		}
+		if len(rows) > 0 {
+			failedChanges[k] = &tableChange{
+				table: v.table,
+				rows:  rows,
+			}
+		}
+	}
+	return failedChanges
 }
 
 func (df *Diff) retryFailedRows(ctx context.Context) {
@@ -520,35 +644,7 @@ func (df *Diff) retryFailedRows(ctx context.Context) {
 		// TODO limit number of retry, if number of retry > max_retry_count or after some time, move rows to error-rows
 		// TODO if error-rows > max_error_rows, pause validation
 		df.Lock()
-		for _, v := range df.failedChanges {
-			changes := make(map[rowChangeType][][]string)
-			for _, r := range v.rows {
-				changes[r.theType] = append(changes[r.theType], r.pk)
-			}
-			rows := make(map[string]*rowChange, 0)
-			if changes[rowInsert] != nil {
-				failedRows := df.validateChanges(ctx, v.table, changes[rowInsert], rowInsert)
-				for _, pk := range failedRows {
-					key := strings.Join(pk, "-")
-					rows[key] = v.rows[key]
-				}
-			}
-			if changes[rowUpdated] != nil {
-				failedRows := df.validateChanges(ctx, v.table, changes[rowUpdated], rowUpdated)
-				for _, pk := range failedRows {
-					key := strings.Join(pk, "-")
-					rows[key] = v.rows[key]
-				}
-			}
-			if changes[rowDeleted] != nil {
-				failedRows := df.validateChanges(ctx, v.table, changes[rowDeleted], rowDeleted)
-				for _, pk := range failedRows {
-					key := strings.Join(pk, "-")
-					rows[key] = v.rows[key]
-				}
-			}
-			v.rows = rows
-		}
+		df.failedChanges = df.validateTableChange(ctx, df.failedChanges)
 		df.Unlock()
 		cnt, ts := df.getContinueValidationSummary()
 		if cnt > 0 {
