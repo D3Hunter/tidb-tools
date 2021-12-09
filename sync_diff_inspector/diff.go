@@ -29,13 +29,14 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
-	dmutils "github.com/pingcap/dm/pkg/utils"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/log"
+	dmutils "github.com/pingcap/ticdc/dm/pkg/utils"
 	tidbconfig "github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/siddontang/go/ioutil2"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
@@ -96,28 +97,30 @@ type Diff struct {
 	continuousWg sync.WaitGroup
 	cfg          *config.Config
 	sync.RWMutex
-	failedChanges    map[string]*tableChange
-	pendingChanges   map[string]*tableChange
-	validateCh       chan map[string]*tableChange
-	changeEventCount []int
-	validationTimer  *time.Timer
+	failedChanges      map[string]*tableChange
+	failedRowCnt       atomic.Int64
+	accumulatedChanges map[string]*tableChange
+	pendingRowCnt      atomic.Int64
+	pendingChangeCh    chan map[string]*tableChange
+	changeEventCount   []int
+	validationTimer    *time.Timer
 }
 
 // NewDiff returns a Diff instance.
 func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 	diff = &Diff{
-		checkThreadCount: cfg.CheckThreadCount,
-		exportFixSQL:     cfg.ExportFixSQL,
-		ignoreDataCheck:  cfg.CheckStructOnly,
-		sqlCh:            make(chan *ChunkDML, splitter.DefaultChannelBuffer),
-		cp:               new(checkpoints.Checkpoint),
-		report:           report.NewReport(&cfg.Task),
-		cfg:              cfg,
-		failedChanges:    make(map[string]*tableChange),
-		pendingChanges:   make(map[string]*tableChange),
-		validateCh:       make(chan map[string]*tableChange),
-		changeEventCount: make([]int, rowUpdated+1),
-		validationTimer:  time.NewTimer(validationInterval),
+		checkThreadCount:   cfg.CheckThreadCount,
+		exportFixSQL:       cfg.ExportFixSQL,
+		ignoreDataCheck:    cfg.CheckStructOnly,
+		sqlCh:              make(chan *ChunkDML, splitter.DefaultChannelBuffer),
+		cp:                 new(checkpoints.Checkpoint),
+		report:             report.NewReport(&cfg.Task),
+		cfg:                cfg,
+		failedChanges:      make(map[string]*tableChange),
+		accumulatedChanges: make(map[string]*tableChange),
+		pendingChangeCh:    make(chan map[string]*tableChange),
+		changeEventCount:   make([]int, rowUpdated+1),
+		validationTimer:    time.NewTimer(validationInterval),
 	}
 	if err = diff.init(ctx, cfg); err != nil {
 		diff.Close()
@@ -391,13 +394,28 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 	go df.validateGoRoutine(ctx)
 
 	// TODO context done
+	var latestPos mysql.Position
 	for {
 		e, err := binlogStreamer.GetEvent(ctx)
 		if err != nil {
-			return err
+			log.Error("get event failed", zap.Reflect("error", err))
+			if myErr, ok:=err.(*mysql.MyError); ok && myErr.Code == mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG {
+				// retry
+				for {
+					binlogStreamer, err = binlogSyncer.StartSync(latestPos)
+					if err != nil {
+						log.Error("failed to restart sync", zap.Reflect("error", err))
+						time.Sleep(time.Second)
+						continue
+					}
+					break
+				}
+			}
+			continue
 		}
-		fmt.Printf("\revents: %3d/%3d/%3d, current log pos %d",
-			df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted], e.Header.LogPos)
+		fmt.Printf("\revents: %3d/%3d/%3d, pending: %d, failed: %d",
+			df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted],
+			df.pendingRowCnt.Load(), df.failedRowCnt.Load())
 		eventTime := time.Unix(int64(e.Header.Timestamp), 0)
 		lag := time.Now().Sub(eventTime)
 		// TODO delay should be configurable
@@ -406,6 +424,8 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		}
 
 		switch ev := e.Event.(type) {
+		case *replication.RotateEvent:
+			latestPos.Name = string(ev.NextLogName)
 		case *replication.QueryEvent:
 			// TODO not processed now
 		case *replication.RowsEvent:
@@ -413,6 +433,7 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 				return err
 			}
 		}
+		latestPos.Pos = e.Header.LogPos
 	}
 	return nil
 }
@@ -440,9 +461,9 @@ func (df *Diff) rowsEventProcessRoutine(ctx context.Context) {
 	}
 }
 
-func (df *Diff) getPendingRowCount() int {
+func (df *Diff) getRowCount(c map[string]*tableChange) int {
 	res := 0
-	for _, v:= range df.pendingChanges {
+	for _, v := range c {
 		res += len(v.rows)
 	}
 	return res
@@ -493,16 +514,16 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 
 	// TODO for every table merge events into batch
 	// TODO for every table validate the batch
-	rowCount := df.getPendingRowCount()
+	rowCount := df.getRowCount(df.accumulatedChanges)
 	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
-	change := df.pendingChanges[fullTableName]
+	change := df.accumulatedChanges[fullTableName]
 	for _, pkValue := range pkValues {
 		if change == nil {
 			change = &tableChange{
 				table: table,
 				rows:  make(map[string]*rowChange),
 			}
-			df.pendingChanges[fullTableName] = change
+			df.accumulatedChanges[fullTableName] = change
 		}
 		key := strings.Join(pkValue, "-")
 		val, ok := change.rows[key]
@@ -510,13 +531,15 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 			val = &rowChange{pk: pkValue}
 			change.rows[key] = val
 			rowCount++
+			df.pendingRowCnt.Inc()
 		}
 		val.theType = changeType
 		val.lastMeetTs = int64(header.Timestamp)
 
 		if rowCount >= batchRowCount {
-			df.validateCh <- df.pendingChanges
-			df.pendingChanges = make(map[string]*tableChange)
+			df.pendingChangeCh <- df.accumulatedChanges
+			df.accumulatedChanges = make(map[string]*tableChange)
+
 			if !df.validationTimer.Stop() {
 				<-df.validationTimer.C
 			}
@@ -529,15 +552,14 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 
 	select {
 	case <-df.validationTimer.C:
-		if len(df.pendingChanges) > 0 {
-			df.validateCh <- df.pendingChanges
-			df.pendingChanges = make(map[string]*tableChange)
+		if rowCount > 0 {
+			df.pendingChangeCh <- df.accumulatedChanges
+			df.accumulatedChanges = make(map[string]*tableChange)
 		}
 		df.validationTimer.Reset(validationInterval)
 	default:
 	}
-	// TODO limit number of rows queried
-	// TODO make rows in small events into a batch
+	// TODO make rows in small events into a batch, and group by table
 	return nil
 }
 
@@ -545,10 +567,12 @@ func (df *Diff) validateGoRoutine(ctx context.Context) {
 	df.continuousWg.Done()
 	for {
 		select {
-		case change := <-df.validateCh:
+		case change := <-df.pendingChangeCh:
 			df.Lock()
 			failed := df.validateTableChange(ctx, change)
 			df.updateFailedChanges(change, failed)
+			df.failedRowCnt.Store(int64(df.getRowCount(df.failedChanges)))
+			df.pendingRowCnt.Sub(int64(df.getRowCount(change)))
 			df.Unlock()
 		case <-ctx.Done():
 			return
@@ -645,6 +669,7 @@ func (df *Diff) retryFailedRows(ctx context.Context) {
 		// TODO if error-rows > max_error_rows, pause validation
 		df.Lock()
 		df.failedChanges = df.validateTableChange(ctx, df.failedChanges)
+		df.failedRowCnt.Store(int64(df.getRowCount(df.failedChanges)))
 		df.Unlock()
 		cnt, ts := df.getContinueValidationSummary()
 		if cnt > 0 {
@@ -1020,7 +1045,9 @@ func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, cond *continuou
 			}
 		}
 
-		// more data on downstream, may come from other client, skip it
+		// may have deleted on upstream and haven't synced to downstream,
+		// we mark this as success as we'll check the delete-event later
+		// or downstream removed the pk and added more data by other clients, skip it.
 		if lastUpstreamData == nil && lastDownstreamData != nil {
 			log.Debug("more data on downstream, may come from other client, skip it")
 			break
@@ -1051,7 +1078,9 @@ func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, cond *continuou
 
 		switch cmp {
 		case 1:
-			// more data on downstream, may come from other client, skip it
+			// may have deleted on upstream and haven't synced to downstream,
+			// we mark this as success as we'll check the delete-event later
+			// or downstream removed the pk and added more data by other clients, skip it.
 			log.Debug("more data on downstream, may come from other client, skip it", zap.Reflect("data", lastDownstreamData))
 			lastDownstreamData = nil
 		case -1:
