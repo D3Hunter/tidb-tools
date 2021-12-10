@@ -400,10 +400,12 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		if err != nil {
 			log.Error("get event failed", zap.Reflect("error", err))
 			if myErr, ok:=err.(*mysql.MyError); ok && myErr.Code == mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG {
-				// retry
+				binlogSyncer.Close()
 				for {
+					binlogSyncer = replication.NewBinlogSyncer(syncerCfg)
 					binlogStreamer, err = binlogSyncer.StartSync(latestPos)
 					if err != nil {
+						binlogSyncer.Close()
 						log.Error("failed to restart sync", zap.Reflect("error", err))
 						time.Sleep(time.Second)
 						continue
