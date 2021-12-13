@@ -415,9 +415,6 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 			}
 			continue
 		}
-		fmt.Printf("\revents: %3d/%3d/%3d, pending: %d, failed: %d",
-			df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted],
-			df.pendingRowCnt.Load(), df.failedRowCnt.Load())
 		eventTime := time.Unix(int64(e.Header.Timestamp), 0)
 		lag := time.Now().Sub(eventTime)
 		// TODO delay should be configurable
@@ -672,12 +669,24 @@ func (df *Diff) retryFailedRows(ctx context.Context) {
 		df.Lock()
 		df.failedChanges = df.validateTableChange(ctx, df.failedChanges)
 		df.failedRowCnt.Store(int64(df.getRowCount(df.failedChanges)))
+		if df.failedRowCnt.Load() < 5 {
+			for tableName, t := range df.failedChanges {
+				for _, r := range t.rows {
+					log.Info("failed row after retry: ",
+						zap.String("table", tableName), zap.Reflect("row", r))
+				}
+			}
+		}
 		df.Unlock()
 		cnt, ts := df.getContinueValidationSummary()
 		if cnt > 0 {
-			fmt.Printf("after retry, failed: %3d, min ts: %v\n", cnt, time.Unix(ts, 0))
+			fmt.Printf("events: %3d/%3d/%3d, pending: %d, failed: %d, min ts: %v\n",
+				df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted],
+				df.pendingRowCnt.Load(), df.failedRowCnt.Load(), time.Unix(ts, 0))
 		} else {
-			fmt.Println("all events before delay time are validated successfully.")
+			fmt.Printf("events: %3d/%3d/%3d, pending: %d, failed: %d\n",
+				df.changeEventCount[rowInsert], df.changeEventCount[rowUpdated], df.changeEventCount[rowDeleted],
+				df.pendingRowCnt.Load(), df.failedRowCnt.Load())
 		}
 
 		select {
