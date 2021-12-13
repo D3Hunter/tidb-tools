@@ -101,6 +101,7 @@ type Diff struct {
 	failedRowCnt       atomic.Int64
 	accumulatedChanges map[string]*tableChange
 	pendingRowCnt      atomic.Int64
+	rowsEventChan      chan *replication.BinlogEvent // unbuffered is enough
 	pendingChangeCh    chan map[string]*tableChange
 	changeEventCount   []int
 	validationTimer    *time.Timer
@@ -118,6 +119,7 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		cfg:                cfg,
 		failedChanges:      make(map[string]*tableChange),
 		accumulatedChanges: make(map[string]*tableChange),
+		rowsEventChan:      make(chan *replication.BinlogEvent),
 		pendingChangeCh:    make(chan map[string]*tableChange),
 		changeEventCount:   make([]int, rowUpdated+1),
 		validationTimer:    time.NewTimer(validationInterval),
@@ -389,8 +391,9 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 	}
 	log.Info("start incremental validation")
 
-	df.continuousWg.Add(2)
+	df.continuousWg.Add(3)
 	go df.retryFailedRows(ctx)
+	go df.rowsEventProcessRoutine(ctx)
 	go df.validateGoRoutine(ctx)
 
 	// TODO context done
@@ -399,7 +402,7 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		e, err := binlogStreamer.GetEvent(ctx)
 		if err != nil {
 			log.Error("get event failed", zap.Reflect("error", err))
-			if myErr, ok:=err.(*mysql.MyError); ok && myErr.Code == mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG {
+			if myErr, ok := err.(*mysql.MyError); ok && myErr.Code == mysql.ER_MASTER_FATAL_ERROR_READING_BINLOG {
 				binlogSyncer.Close()
 				for {
 					binlogSyncer = replication.NewBinlogSyncer(syncerCfg)
@@ -428,8 +431,10 @@ func (df *Diff) IncrementalValidate(ctx context.Context) error {
 		case *replication.QueryEvent:
 			// TODO not processed now
 		case *replication.RowsEvent:
-			if err := df.processEventRows(e.Header, ev); err != nil {
-				return err
+			select {
+			case df.rowsEventChan <- e:
+			case <-ctx.Done():
+				return nil
 			}
 		}
 		latestPos.Pos = e.Header.LogPos
@@ -456,6 +461,17 @@ func (df *Diff) rowsEventProcessRoutine(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case e := <-df.rowsEventChan:
+			if err := df.processEventRows(e.Header, e.Event.(*replication.RowsEvent)); err != nil {
+				log.Warn("failed to process event: ", zap.Reflect("error", err))
+			}
+		case <-df.validationTimer.C:
+			rowCount := df.getRowCount(df.accumulatedChanges)
+			if rowCount > 0 {
+				df.pendingChangeCh <- df.accumulatedChanges
+				df.accumulatedChanges = make(map[string]*tableChange)
+			}
+			df.validationTimer.Reset(validationInterval)
 		}
 	}
 }
@@ -549,15 +565,6 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 		}
 	}
 
-	select {
-	case <-df.validationTimer.C:
-		if rowCount > 0 {
-			df.pendingChangeCh <- df.accumulatedChanges
-			df.accumulatedChanges = make(map[string]*tableChange)
-		}
-		df.validationTimer.Reset(validationInterval)
-	default:
-	}
 	// TODO make rows in small events into a batch, and group by table
 	return nil
 }
@@ -673,7 +680,8 @@ func (df *Diff) retryFailedRows(ctx context.Context) {
 			for tableName, t := range df.failedChanges {
 				for _, r := range t.rows {
 					log.Info("failed row after retry: ",
-						zap.String("table", tableName), zap.Reflect("row", r))
+						zap.String("table", tableName), zap.Reflect("key", r.pk),
+						zap.Reflect("type", r.theType), zap.Int64("ts", r.lastMeetTs))
 				}
 			}
 		}
