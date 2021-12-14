@@ -170,6 +170,7 @@ func (s *TiDBSource) GetRows(ctx context.Context, cond *continuous.Cond) (RowDat
 	table := cond.Table
 	matchedSource := getMatchSource(s.sourceTableMap, table)
 	// TODO make delay configurable or come from DM
+	// TODO make stale read configurable
 	fromClause := dbutil.TableName(matchedSource.OriginSchema, matchedSource.OriginTable) + " as of timestamp TIDB_BOUNDED_STALENESS(now() - interval 5 second, now())"
 	rowsQuery, _ := utils.GetTableRowsQueryFormat(fromClause, table.Info, table.Collation)
 	query := fmt.Sprintf(rowsQuery, cond.GetWhere())

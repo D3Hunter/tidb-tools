@@ -16,6 +16,7 @@ package continuous
 import (
 	"strings"
 
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/sync_diff_inspector/source/common"
 )
 
@@ -51,4 +52,22 @@ func (c *Cond) GetWhere() string {
 	}
 	b.WriteString(")")
 	return b.String()
+}
+
+type SimpleRowsIterator struct {
+	Rows []map[string]*dbutil.ColumnData
+	Idx  int
+}
+
+func (b *SimpleRowsIterator) Next() (map[string]*dbutil.ColumnData, error) {
+	if b.Idx >= len(b.Rows) {
+		return nil, nil
+	}
+	row := b.Rows[b.Idx]
+	b.Idx++
+	return row, nil
+}
+
+func (b *SimpleRowsIterator) Close() {
+	// skip
 }

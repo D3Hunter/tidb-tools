@@ -22,6 +22,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -341,6 +342,7 @@ type tableChange struct {
 
 type rowChange struct {
 	pk         []string
+	data       []interface{}
 	theType    rowChangeType
 	lastMeetTs int64 // the last meet timestamp(in seconds)
 }
@@ -508,23 +510,14 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 
 	df.changeEventCount[changeType]++
 
-	pkValues := make([][]string, 0)
-	step := 1
+	init, step := 0, 1
 	if changeType == rowUpdated {
-		step = 2
+		init, step = 1, 2
 	}
 	pk := table.PrimaryKey
 	pkIndices := make([]int, len(pk.Columns))
 	for i, col := range pk.Columns {
 		pkIndices[i] = table.ColumnMap[col.Name.O].Offset
-	}
-	for i := 0; i < len(ev.Rows); i += step {
-		row := ev.Rows[i]
-		key := make([]string, len(pk.Columns))
-		for _, idx := range pkIndices {
-			key[idx] = fmt.Sprintf("%v", row[idx])
-		}
-		pkValues = append(pkValues, key)
 	}
 
 	// TODO for every table merge events into batch
@@ -532,7 +525,13 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 	rowCount := df.getRowCount(df.accumulatedChanges)
 	fullTableName := fmt.Sprintf("%s.%s", table.Schema, table.Table)
 	change := df.accumulatedChanges[fullTableName]
-	for _, pkValue := range pkValues {
+	for i := init; i < len(ev.Rows); i += step {
+		row := ev.Rows[i]
+		pkValue := make([]string, len(pk.Columns))
+		for _, idx := range pkIndices {
+			pkValue[idx] = fmt.Sprintf("%v", row[idx])
+		}
+
 		if change == nil {
 			change = &tableChange{
 				table: table,
@@ -548,6 +547,7 @@ func (df *Diff) processEventRows(header *replication.EventHeader, ev *replicatio
 			rowCount++
 			df.pendingRowCnt.Inc()
 		}
+		val.data = row
 		val.theType = changeType
 		val.lastMeetTs = int64(header.Timestamp)
 
@@ -586,14 +586,18 @@ func (df *Diff) validateGoRoutine(ctx context.Context) {
 	}
 }
 
-func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, pkValues [][]string, deleteChange bool) [][]string {
+func (df *Diff) validateChanges(ctx context.Context, table *common.TableDiff, rows []*rowChange, deleteChange bool) [][]string {
+	pkValues := make([][]string, 0, len(rows))
+	for _, r := range rows {
+		pkValues = append(pkValues, r.pk)
+	}
 	cond := &continuous.Cond{Table: table, PkValues: pkValues}
 	var failedRows [][]string
 	var err error
 	if deleteChange {
 		failedRows, err = df.validateDeletedRows(ctx, cond)
 	} else {
-		failedRows, err = df.validateInsertAndUpdateRows(ctx, cond)
+		failedRows, err = df.validateInsertAndUpdateRows(ctx, rows, cond)
 	}
 	if err != nil {
 		panic(err)
@@ -633,12 +637,12 @@ func (df *Diff) updateFailedChanges(all, failed map[string]*tableChange) {
 func (df *Diff) validateTableChange(ctx context.Context, tableChanges map[string]*tableChange) map[string]*tableChange {
 	failedChanges := make(map[string]*tableChange)
 	for k, v := range tableChanges {
-		var insertUpdateChanges, deleteChanges [][]string
+		var insertUpdateChanges, deleteChanges []*rowChange
 		for _, r := range v.rows {
 			if r.theType == rowDeleted {
-				deleteChanges = append(deleteChanges, r.pk)
+				deleteChanges = append(deleteChanges, r)
 			} else {
-				insertUpdateChanges = append(insertUpdateChanges, r.pk)
+				insertUpdateChanges = append(insertUpdateChanges, r)
 			}
 		}
 		rows := make(map[string]*rowChange, 0)
@@ -1032,9 +1036,42 @@ func getPkValues(data map[string]*dbutil.ColumnData, cond *continuous.Cond) []st
 	return pkValues
 }
 
-func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, cond *continuous.Cond) ([][]string, error) {
+func (df *Diff) getRowChangeIterator(table *common.TableDiff, rows []*rowChange) (source.RowDataIterator, error) {
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		for idx := range left.pk {
+			if left.pk[idx] != right.pk[idx] {
+				return left.pk[idx] < right.pk[idx]
+			}
+		}
+		return false
+	})
+
+	// TODO columns in table.Info.Columns may diff with binlog row columns
+	// TODO for datetime/timestamp type, should make sure timezone is the same between upstream and downstream
+	it := &continuous.SimpleRowsIterator{}
+	for _, r := range rows {
+		colMap := make(map[string]*dbutil.ColumnData)
+		for _, c := range table.Info.Columns {
+			var colData []byte
+			if r.data[c.Offset] != nil {
+				colData = []byte(fmt.Sprintf("%v", r.data[c.Offset]))
+			}
+			colMap[c.Name.O] = &dbutil.ColumnData{
+				Data:   colData,
+				IsNull: r.data[c.Offset] == nil,
+			}
+		}
+		it.Rows = append(it.Rows, colMap)
+	}
+	return it, nil
+}
+
+func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, rows []*rowChange, cond *continuous.Cond) ([][]string, error) {
 	var failedRows [][]string
-	upstreamRowsIterator, err := df.upstream.GetRows(ctx, cond)
+	// TODO support both ways in case binlog doesn't contain complete rows
+	//upstreamRowsIterator, err := df.upstream.GetRows(ctx, cond)
+	upstreamRowsIterator, err := df.getRowChangeIterator(cond.Table, rows)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
