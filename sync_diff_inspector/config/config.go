@@ -275,6 +275,8 @@ type Config struct {
 	// only check table struct without table data.
 	CheckStructOnly bool `toml:"check-struct-only" json:"check-struct-only"`
 	Incremental bool `toml:"incremental" json:"incremental"`
+	UseBinlogForCompare bool `toml:"use-binlog-for-compare" json:"use-binlog-for-compare"`
+	UseStaleRead bool `toml:"use-stale-read" json:"use-stale-read"`
 	// DMAddr is dm-master's address, the format should like "http://127.0.0.1:8261"
 	DMAddr string `toml:"dm-addr" json:"dm-addr"`
 	// DMTask string `toml:"dm-task" json:"dm-task"`
@@ -309,6 +311,8 @@ func NewConfig() *Config {
 	fs.BoolVar(&cfg.ExportFixSQL, "export-fix-sql", true, "set true if want to compare rows or set to false will only compare checksum")
 	fs.BoolVar(&cfg.CheckStructOnly, "check-struct-only", false, "ignore check table's data")
 	fs.BoolVarP(&cfg.Incremental, "incremental", "i", false, "set true if want to incremental data check")
+	fs.BoolVarP(&cfg.UseBinlogForCompare, "use-binlog-for-compare", "b", false, "set true if want to incremental data check")
+	fs.BoolVarP(&cfg.UseStaleRead, "use-stale-read", "s", false, "set true if want to incremental data check")
 
 	fs.SortFlags = false
 	return cfg

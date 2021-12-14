@@ -89,6 +89,7 @@ type TiDBSource struct {
 	// checkThreadCount is the pool size of produce chunks
 	checkThreadCount int
 	dbConn           *sql.DB
+	useStaleRead     bool
 }
 
 func (s *TiDBSource) GetTableAnalyzer() TableAnalyzer {
@@ -171,7 +172,10 @@ func (s *TiDBSource) GetRows(ctx context.Context, cond *continuous.Cond) (RowDat
 	matchedSource := getMatchSource(s.sourceTableMap, table)
 	// TODO make delay configurable or come from DM
 	// TODO make stale read configurable
-	fromClause := dbutil.TableName(matchedSource.OriginSchema, matchedSource.OriginTable) + " as of timestamp TIDB_BOUNDED_STALENESS(now() - interval 5 second, now())"
+	fromClause := dbutil.TableName(matchedSource.OriginSchema, matchedSource.OriginTable)
+	if s.useStaleRead {
+		fromClause += " as of timestamp TIDB_BOUNDED_STALENESS(now() - interval 5 second, now())"
+	}
 	rowsQuery, _ := utils.GetTableRowsQueryFormat(fromClause, table.Info, table.Collation)
 	query := fmt.Sprintf(rowsQuery, cond.GetWhere())
 
@@ -273,7 +277,7 @@ func getSourceTableMap(ctx context.Context, tableDiffs []*common.TableDiff, ds *
 	return sourceTableMap, nil
 }
 
-func NewTiDBSource(ctx context.Context, tableDiffs []*common.TableDiff, ds *config.DataSource, checkThreadCount int) (Source, error) {
+func NewTiDBSource(ctx context.Context, tableDiffs []*common.TableDiff, ds *config.DataSource, checkThreadCount int, useStaleRead bool) (Source, error) {
 	sourceTableMap, err := getSourceTableMap(ctx, tableDiffs, ds)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -284,6 +288,7 @@ func NewTiDBSource(ctx context.Context, tableDiffs []*common.TableDiff, ds *conf
 		snapshot:         ds.Snapshot,
 		dbConn:           ds.Conn,
 		checkThreadCount: checkThreadCount,
+		useStaleRead:     useStaleRead,
 	}
 	return ts, nil
 }

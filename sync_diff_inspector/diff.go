@@ -1070,8 +1070,13 @@ func (df *Diff) getRowChangeIterator(table *common.TableDiff, rows []*rowChange)
 func (df *Diff) validateInsertAndUpdateRows(ctx context.Context, rows []*rowChange, cond *continuous.Cond) ([][]string, error) {
 	var failedRows [][]string
 	// TODO support both ways in case binlog doesn't contain complete rows
-	//upstreamRowsIterator, err := df.upstream.GetRows(ctx, cond)
-	upstreamRowsIterator, err := df.getRowChangeIterator(cond.Table, rows)
+	var upstreamRowsIterator source.RowDataIterator
+	var err error
+	if df.cfg.UseBinlogForCompare {
+		upstreamRowsIterator, err = df.getRowChangeIterator(cond.Table, rows)
+	} else {
+		upstreamRowsIterator, err = df.upstream.GetRows(ctx, cond)
+	}
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
