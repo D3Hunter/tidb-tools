@@ -44,7 +44,7 @@ const (
 	Replace
 )
 
-const UnifiedTimeZone string = "+0:00"
+const UnifiedTimeZone string = "+8:00"
 
 type ChecksumInfo struct {
 	Checksum int64
