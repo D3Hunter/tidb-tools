@@ -176,7 +176,8 @@ func (s *MySQLSources) GetRows(ctx context.Context, cond *continuous.Cond) (RowD
 	var rowsQuery string
 	var orderKeyCols []*model.ColumnInfo
 	for i, ms := range matchSources {
-		rowsQuery, orderKeyCols = utils.GetTableRowsQueryFormat(ms.OriginSchema, ms.OriginTable, table.Info, table.Collation)
+		fullTableName := dbutil.TableName(ms.OriginSchema, ms.OriginTable)
+		rowsQuery, orderKeyCols = utils.GetTableRowsQueryFormat(fullTableName, table.Info, table.Collation)
 		query := fmt.Sprintf(rowsQuery, cond.GetWhere())
 		rows, err := ms.DBConn.QueryContext(ctx, query, cond.GetArgs()...)
 		if err != nil {
@@ -225,7 +226,8 @@ func (s *MySQLSources) GetRowsIterator(ctx context.Context, tableRange *splitter
 	var rowsQuery string
 	var orderKeyCols []*model.ColumnInfo
 	for i, ms := range matchSources {
-		rowsQuery, orderKeyCols = utils.GetTableRowsQueryFormat(ms.OriginSchema, ms.OriginTable, table.Info, table.Collation)
+		fullTableName := dbutil.TableName(ms.OriginSchema, ms.OriginTable)
+		rowsQuery, orderKeyCols = utils.GetTableRowsQueryFormat(fullTableName, table.Info, table.Collation)
 		query := fmt.Sprintf(rowsQuery, chunk.Where)
 		rows, err := ms.DBConn.QueryContext(ctx, query, chunk.Args...)
 		if err != nil {

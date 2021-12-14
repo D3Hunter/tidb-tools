@@ -169,7 +169,9 @@ func (s *TiDBSource) GenerateFixSQL(t DMLType, upstreamData, downstreamData map[
 func (s *TiDBSource) GetRows(ctx context.Context, cond *continuous.Cond) (RowDataIterator, error) {
 	table := cond.Table
 	matchedSource := getMatchSource(s.sourceTableMap, table)
-	rowsQuery, _ := utils.GetTableRowsQueryFormat(matchedSource.OriginSchema, matchedSource.OriginTable, table.Info, table.Collation)
+	// TODO make delay configurable or come from DM
+	fromClause := dbutil.TableName(matchedSource.OriginSchema, matchedSource.OriginTable) + " as of timestamp TIDB_BOUNDED_STALENESS(now() - interval 5 second, now())"
+	rowsQuery, _ := utils.GetTableRowsQueryFormat(fromClause, table.Info, table.Collation)
 	query := fmt.Sprintf(rowsQuery, cond.GetWhere())
 
 	if cd := log.L().Check(zapcore.DebugLevel, ""); cd != nil {
@@ -189,7 +191,8 @@ func (s *TiDBSource) GetRowsIterator(ctx context.Context, tableRange *splitter.R
 
 	table := s.tableDiffs[tableRange.GetTableIndex()]
 	matchedSource := getMatchSource(s.sourceTableMap, table)
-	rowsQuery, _ := utils.GetTableRowsQueryFormat(matchedSource.OriginSchema, matchedSource.OriginTable, table.Info, table.Collation)
+	fullTableName := dbutil.TableName(matchedSource.OriginSchema, matchedSource.OriginTable)
+	rowsQuery, _ := utils.GetTableRowsQueryFormat(fullTableName, table.Info, table.Collation)
 	query := fmt.Sprintf(rowsQuery, chunk.Where)
 
 	log.Debug("select data", zap.String("sql", query), zap.Reflect("args", chunk.Args))

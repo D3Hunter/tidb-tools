@@ -119,7 +119,7 @@ func GetColumnsFromIndex(index *model.IndexInfo, tableInfo *model.TableInfo) []*
 
 // GetTableRowsQueryFormat returns a rowsQuerySQL template for the specific table.
 //  e.g. SELECT /*!40001 SQL_NO_CACHE */ `a`, `b` FROM `schema`.`table` WHERE %s ORDER BY `a`.
-func GetTableRowsQueryFormat(schema, table string, tableInfo *model.TableInfo, collation string) (string, []*model.ColumnInfo) {
+func GetTableRowsQueryFormat(fromClause string, tableInfo *model.TableInfo, collation string) (string, []*model.ColumnInfo) {
 	orderKeys, orderKeyCols := dbutil.SelectUniqueOrderKey(tableInfo)
 
 	columnNames := make([]string, 0, len(tableInfo.Columns))
@@ -136,7 +136,7 @@ func GetTableRowsQueryFormat(schema, table string, tableInfo *model.TableInfo, c
 	}
 
 	query := fmt.Sprintf("SELECT /*!40001 SQL_NO_CACHE */ %s FROM %s WHERE %%s ORDER BY %s%s",
-		columns, dbutil.TableName(schema, table), strings.Join(orderKeys, ","), collation)
+		columns, fromClause, strings.Join(orderKeys, ","), collation)
 
 	return query, orderKeyCols
 }
