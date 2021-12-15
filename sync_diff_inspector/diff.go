@@ -121,7 +121,7 @@ func NewDiff(ctx context.Context, cfg *config.Config) (diff *Diff, err error) {
 		failedChanges:      make(map[string]*tableChange),
 		accumulatedChanges: make(map[string]*tableChange),
 		rowsEventChan:      make(chan *replication.BinlogEvent),
-		pendingChangeCh:    make(chan map[string]*tableChange),
+		pendingChangeCh:    make(chan map[string]*tableChange, 1000),
 		changeEventCount:   make([]int, rowUpdated+1),
 		validationTimer:    time.NewTimer(validationInterval),
 	}
@@ -574,6 +574,7 @@ func (df *Diff) validateGoRoutine(ctx context.Context) {
 	for {
 		select {
 		case change := <-df.pendingChangeCh:
+			// TODO maybe merge them and split before validate
 			df.Lock()
 			failed := df.validateTableChange(ctx, change)
 			df.updateFailedChanges(change, failed)
